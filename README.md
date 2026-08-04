@@ -147,3 +147,7 @@ make install     # python3 bin/install.py --global
 | `store/brain.db` | the memory store |
 | `schema/node.schema.json` | node format |
 | `tests/` · `docs/` | tests · guides |
+
+## License
+
+[MIT](LICENSE)
