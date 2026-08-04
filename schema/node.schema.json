@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brain-claude.local/node.schema.json",
+  "title": "Brain-Claude memory node",
+  "description": "One node in the Brain-Claude knowledge graph. Emitted by Claude inside a <brain-update>{...}</brain-update> block at session wrap-up, or written directly via `brain.py save`.",
+  "type": "object",
+  "required": ["node_id"],
+  "additionalProperties": false,
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "description": "Unique id, convention YYYY-MM-DD-taskslug.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+$"
+    },
+    "tags": {
+      "type": "string",
+      "description": "Space-separated retrieval keywords."
+    },
+    "context": {
+      "type": "string",
+      "description": "Background of the task."
+    },
+    "actions_taken": {
+      "type": "string",
+      "description": "What was done."
+    },
+    "user_feedback": {
+      "type": "string",
+      "description": "What worked / what didn't — quote the user verbatim where possible."
+    },
+    "metrics": {
+      "type": "array",
+      "description": "Measurable outcomes for this task. Direction decides when a target is met.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "description": "e.g. speed, accuracy, loc, review_rounds, coverage"},
+          "value": {"type": ["number", "null"]},
+          "unit": {"type": ["string", "null"], "description": "e.g. min, %, count"},
+          "target": {"type": ["number", "null"], "description": "goal value"},
+          "dir": {
+            "type": "string",
+            "enum": ["min", "max"],
+            "default": "min",
+            "description": "'min' (default): lower is better, met when value<=target (speed, loc, review_rounds). 'max': higher is better, met when value>=target (coverage, accuracy, tests_passing)."
+          },
+          "source": {
+            "type": "string",
+            "enum": ["self", "measured"],
+            "default": "self",
+            "description": "Provenance. 'self': authored by the model (self-reported — do not fabricate). 'measured': computed by the shell via `brain.py annotate`. Defaults to 'self' when omitted."
+          }
+        }
+      }
+    },
+    "lessons_learned": {
+      "type": "string",
+      "description": "Refined process to apply next time."
+    },
+    "related_nodes": {
+      "type": "array",
+      "description": "node_ids of related past nodes — these are the graph edges.",
+      "items": {"type": "string"}
+    },
+    "pending_items": {
+      "type": "array",
+      "description": "Unfinished next-steps to surface in a future session.",
+      "items": {"type": "string"}
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "merged"],
+      "default": "active"
+    }
+  }
+}

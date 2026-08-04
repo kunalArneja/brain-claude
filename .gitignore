@@ -1,0 +1,17 @@
+# Brain-Claude runtime data — NEVER commit. May contain sensitive project
+# context, and the dead-letter file can hold secrets that failed redaction.
+store/
+# (covers store/brain.db, brain.db-wal, brain.db-shm, rejected.jsonl, events.log)
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local, personal Claude Code settings (shared settings.json stays tracked)
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+*.swp
