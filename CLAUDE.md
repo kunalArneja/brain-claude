@@ -31,6 +31,16 @@ When the task (or session) is winding down, emit **exactly one** block. The Stop
 hook parses your final message for it and writes it to the store automatically —
 no copy-paste. Emit it only when there's something worth remembering.
 
+> **Auto-capture backstop.** If a substantive session ends with *no* block, the
+> SessionEnd hook writes a lightweight `origin:"auto"` node from transcript facts
+> (files edited, commands run, first prompt, turn counts) — one rolling node per
+> project per day, gated so trivial read-only sessions are skipped. Auto nodes are
+> a searchable audit trail: they show up in explicit `recall --query` but are
+> **excluded from proactive recall**, and self-prune after 14 days. They never
+> carry `lessons_learned`/`user_feedback` (those can't be synthesised honestly) —
+> so a real block you author is still the only way a *lesson* reaches the graph.
+> Don't rely on the backstop; emit a block whenever there's a lesson worth keeping.
+
 ```
 <brain-update>
 {

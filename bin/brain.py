@@ -55,7 +55,7 @@ DB_PATH = os.environ.get("BRAIN_DB", os.path.join(STORE_DIR, "brain.db"))
 REJECTED_LOG = os.path.join(STORE_DIR, "rejected.jsonl")
 EVENT_LOG = os.path.join(STORE_DIR, "events.log")
 
-SCHEMA_VERSION = 5  # bump when init_db's schema changes
+SCHEMA_VERSION = 6  # bump when init_db's schema changes
 
 SEM_FLOOR = 0.6      # min cosine for a semantic-only (no keyword) match to count
 
@@ -63,6 +63,11 @@ SEM_FLOOR = 0.6      # min cosine for a semantic-only (no keyword) match to coun
 MERGE_SEM, MERGE_KW = 0.75, 0.40      # "related" — loose, for merge suggestions
 DEDUP_SEM, DEDUP_KW = 0.92, 0.75      # "near-duplicate" — tight, safe to consolidate
 ARCHIVE_DAYS = 180
+AUTO_TTL_DAYS = 14   # auto-captured session nodes self-prune faster than curated ones
+
+# --- auto-capture (mechanical SessionEnd backstop) --- #
+AUTO_MIN_TURNS = 6          # a session with fewer assistant turns is too trivial to log
+AUTO_CONTEXT_MAX = 200      # truncate the first user prompt to this many chars
 
 # Long-form text fields on a node (everything that isn't structured JSON).
 TEXT_FIELDS = ("tags", "context", "actions_taken", "user_feedback", "lessons_learned")
@@ -223,6 +228,7 @@ def init_db(conn):
             related_nodes   TEXT DEFAULT '[]',   -- JSON array of node_ids
             pending_items   TEXT DEFAULT '[]',   -- JSON array of strings
             status          TEXT DEFAULT 'active',
+            origin          TEXT DEFAULT 'curated',  -- 'curated': model-authored block; 'auto': mechanical backstop
             project         TEXT DEFAULT '',     -- scoping key ('' or '*' = global)
             created_at      TEXT,
             updated_at      TEXT
@@ -265,6 +271,9 @@ def init_db(conn):
     node_cols = [r["name"] for r in conn.execute("PRAGMA table_info(nodes)")]
     if "project" not in node_cols:
         conn.execute("ALTER TABLE nodes ADD COLUMN project TEXT DEFAULT ''")
+    if "origin" not in node_cols:
+        # Existing rows predate auto-capture — they are all curated.
+        conn.execute("ALTER TABLE nodes ADD COLUMN origin TEXT DEFAULT 'curated'")
     # Create the index only now that the column is guaranteed to exist (works for
     # both fresh stores and ones migrated up from an earlier schema).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project)")
@@ -454,6 +463,7 @@ def save_node(conn, node, on_conflict="update"):
         "related_nodes": json.dumps(node.get("related_nodes", []) or []),
         "pending_items": json.dumps(node.get("pending_items", []) or []),
         "status": node.get("status", "active") or "active",
+        "origin": node.get("origin", "curated") or "curated",
         "project": project,
         "created_at": created_at,
         "updated_at": now,
@@ -463,16 +473,17 @@ def save_node(conn, node, on_conflict="update"):
         """
         INSERT INTO nodes (node_id, tags, context, actions_taken, user_feedback,
                            metrics, lessons_learned, related_nodes, pending_items,
-                           status, project, created_at, updated_at)
+                           status, origin, project, created_at, updated_at)
         VALUES (:node_id, :tags, :context, :actions_taken, :user_feedback,
                 :metrics, :lessons_learned, :related_nodes, :pending_items,
-                :status, :project, :created_at, :updated_at)
+                :status, :origin, :project, :created_at, :updated_at)
         ON CONFLICT(node_id) DO UPDATE SET
             tags=excluded.tags, context=excluded.context,
             actions_taken=excluded.actions_taken, user_feedback=excluded.user_feedback,
             metrics=excluded.metrics, lessons_learned=excluded.lessons_learned,
             related_nodes=excluded.related_nodes, pending_items=excluded.pending_items,
-            status=excluded.status, project=excluded.project, updated_at=excluded.updated_at
+            status=excluded.status, origin=excluded.origin, project=excluded.project,
+            updated_at=excluded.updated_at
         """,
         row,
     )
@@ -522,6 +533,7 @@ def row_to_node(row):
         "related_nodes": _arr(row["related_nodes"]),
         "pending_items": _arr(row["pending_items"]),
         "status": row["status"],
+        "origin": row["origin"] if "origin" in row.keys() else "curated",
         "project": row["project"],
     }
 
@@ -716,9 +728,12 @@ def search(conn, query, k=5, project=None, scope="all"):
 
 
 def recent(conn, k=5, project=None, scope="all"):
+    # Auto (mechanical) nodes are excluded from proactive injection so they never
+    # crowd out curated lessons; they remain findable via explicit `search`.
     sc, sp = _scope_clause("project", project, scope)
     return conn.execute(
-        f"SELECT * FROM nodes WHERE status='active'{sc} ORDER BY updated_at DESC LIMIT ?",
+        f"SELECT * FROM nodes WHERE status='active' AND COALESCE(origin,'curated')!='auto'"
+        f"{sc} ORDER BY updated_at DESC LIMIT ?",
         (*sp, k),
     ).fetchall()
 
@@ -728,7 +743,8 @@ def open_pending(conn, project=None, scope="all"):
     sc, sp = _scope_clause("project", project, scope)
     for r in conn.execute(
         f"SELECT node_id, pending_items FROM nodes WHERE status='active' "
-        f"AND pending_items != '[]'{sc} ORDER BY updated_at DESC", sp
+        f"AND COALESCE(origin,'curated')!='auto' AND pending_items != '[]'{sc} "
+        f"ORDER BY updated_at DESC", sp
     ):
         try:
             items = json.loads(r["pending_items"])
@@ -821,6 +837,176 @@ def derive_transcript_metrics(path):
         out.append({"name": "assistant_turns", "value": turns, "source": "measured"})
     out.append({"name": "file_edits", "value": edits, "source": "measured"})
     return out
+
+
+def _user_text(obj):
+    """Extract genuinely user-typed text from a transcript record.
+
+    Ignores tool_result payloads (which are also role='user') so we capture the
+    prompt the human actually wrote, not a tool's return value.
+    """
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    if (msg.get("role") or obj.get("type")) != "user":
+        return ""
+    content = msg.get("content", obj.get("content"))
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif isinstance(c, str):
+                parts.append(c)
+    return "\n".join(parts)
+
+
+_TAG_TOKEN = re.compile(r"^[A-Za-z0-9][\w.\-]*$")   # a safe, storable keyword
+
+
+def _command_verb(cmd):
+    """The actual program name from a shell command, or None.
+
+    Skips leading `VAR=value` env-assignments (e.g. `PGPASSWORD=… psql`) so we
+    never harvest a secret or a base64 blob as if it were a command — the first
+    *bare* token is the verb. Returns only clean, storable identifiers.
+    """
+    for tok in cmd.split():
+        if re.match(r"^\w+=", tok):        # env assignment / VAR=value — skip
+            continue
+        tok = tok.rsplit("/", 1)[-1]       # /usr/local/go/bin/go -> go
+        return tok if _TAG_TOKEN.match(tok) else None
+    return None
+
+
+def summarize_transcript(path):
+    """Mechanical facts the shell can see — the raw material for an auto node.
+
+    Returns {turns, edits, files, commands, committed, first_prompt}. No model
+    judgment: every field is something literally present in the transcript.
+    """
+    EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    FILE_CAP, CMD_CAP = 20, 10          # bound the lists so a long session can't bloat
+    turns = edits = 0
+    files, commands = [], []
+    committed = False
+    first_prompt = ""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not first_prompt:
+                    ut = _user_text(obj).strip()
+                    # Skip injected hook context (wrapped in <...> reminder tags).
+                    if ut and not ut.startswith("<"):
+                        first_prompt = ut
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                if (msg.get("role") or obj.get("type")) != "assistant":
+                    continue
+                turns += 1
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for c in content:
+                    if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                        continue
+                    name = c.get("name")
+                    inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                    if name in EDIT_TOOLS:
+                        edits += 1
+                        fp = inp.get("file_path")
+                        if fp:
+                            base = os.path.basename(fp)
+                            if base not in files and len(files) < FILE_CAP:
+                                files.append(base)
+                    elif name == "Bash":
+                        cmd = (inp.get("command") or "").strip()
+                        verb = _command_verb(cmd)
+                        if verb and verb not in commands and len(commands) < CMD_CAP:
+                            commands.append(verb)
+                        if "git commit" in cmd or "git push" in cmd:
+                            committed = True
+    except (FileNotFoundError, OSError):
+        return None
+    return {"turns": turns, "edits": edits, "files": files,
+            "commands": commands, "committed": committed, "first_prompt": first_prompt}
+
+
+def _auto_node(summary, project):
+    """Build a lightweight 'auto' node from transcript facts — or None if the
+    session was too trivial to be worth logging (the significance gate)."""
+    if not summary:
+        return None
+    significant = (summary["edits"] >= 1 or summary["committed"]
+                   or summary["turns"] >= AUTO_MIN_TURNS)
+    if not significant:
+        return None
+    actions = []
+    if summary["files"]:
+        actions.append("Edited " + ", ".join(summary["files"]))
+    if summary["commands"]:
+        actions.append("ran " + ", ".join(summary["commands"]))
+    # Defense-in-depth: only clean identifier tokens become tags — never a token
+    # carrying '=', '/', quotes or a blob (so a stray secret can't leak here).
+    tag_tokens = [t for t in dict.fromkeys(summary["files"] + summary["commands"])
+                  if _TAG_TOKEN.match(t)]
+    tags = " ".join(tag_tokens)
+    return {
+        "node_id": f"{_now()[:10]}-auto-{project or 'global'}",
+        "origin": "auto",
+        "tags": tags,
+        "context": summary["first_prompt"][:AUTO_CONTEXT_MAX],
+        "actions_taken": "; ".join(actions),
+        # lessons_learned / user_feedback stay empty — we cannot synthesise them honestly.
+        "metrics": [
+            {"name": "assistant_turns", "value": summary["turns"], "source": "measured"},
+            {"name": "file_edits", "value": summary["edits"], "source": "measured"},
+        ],
+        "status": "active",
+    }
+
+
+def _merge_auto(existing, node):
+    """Fold a new auto node into the day's existing rolling node (append, dedup).
+
+    Keeps one auto node per project per day instead of one per session.
+    """
+    if existing is None:
+        return node
+    # Append distinct action clauses.
+    prev_actions = existing["actions_taken"] or ""
+    parts = [p for p in prev_actions.split("; ") if p]
+    for p in node["actions_taken"].split("; "):
+        if p and p not in parts:
+            parts.append(p)
+    node["actions_taken"] = "; ".join(parts)
+    # Union tags.
+    node["tags"] = " ".join(dict.fromkeys(
+        (existing["tags"] or "").split() + node["tags"].split()))
+    # Keep the earliest prompt as context; append later distinct ones.
+    prev_ctx = existing["context"] or ""
+    if prev_ctx and node["context"] and node["context"] not in prev_ctx:
+        node["context"] = (prev_ctx + " | " + node["context"])[:AUTO_CONTEXT_MAX * 2]
+    elif prev_ctx:
+        node["context"] = prev_ctx
+    # Accumulate the day's measured totals.
+    def _prev(name):
+        try:
+            for m in json.loads(existing["metrics"]):
+                if m.get("name") == name:
+                    return m.get("value") or 0
+        except (ValueError, TypeError):
+            pass
+        return 0
+    for m in node["metrics"]:
+        m["value"] = (m.get("value") or 0) + _prev(m["name"])
+    return node
 
 
 # --------------------------------------------------------------------------- #
@@ -1019,13 +1205,36 @@ def cmd_ingest(args):
         raw = extract_block_from_transcript(path) if path else None
         if raw and path:
             extra = derive_transcript_metrics(path)
+        if not raw:
+            # No curated block this session — fall back to a mechanical audit node.
+            if path:
+                _auto_capture(conn, path)
+            return
     else:
         msg = read_stdin_json().get("last_assistant_message", "") or ""
         m = BRAIN_BLOCK_RE.search(msg)
         raw = m.group(1) if m else None
-    if not raw:
-        return  # clean no-op — nothing to capture this turn/session
+        if not raw:
+            return  # clean no-op — the SessionEnd backstop handles auto-capture
     _ingest_raw(conn, raw, extra_metrics=extra)
+
+
+def _auto_capture(conn, path):
+    """SessionEnd backstop: log a lightweight node when no block was emitted."""
+    node = _auto_node(summarize_transcript(path), current_project())
+    if node is None:
+        return  # trivial session — deliberately not logged
+    existing = conn.execute(
+        "SELECT tags, context, actions_taken, metrics FROM nodes WHERE node_id=?",
+        (node["node_id"],),
+    ).fetchone()
+    node = _merge_auto(existing, node)
+    try:
+        node_id = save_node(conn, node, on_conflict="update")
+        log_event("auto-capture", node_id)
+        sys.stderr.write(f"brain: auto-captured node {node_id}\n")
+    except ValueError as e:
+        log_event("auto-reject", str(e))
 
 
 def cmd_annotate(args):
@@ -1246,10 +1455,19 @@ def cmd_archive(args):
     sc, sp = _scope_clause("project", args.project or None, scope)
     rows = conn.execute(
         f"SELECT node_id FROM nodes WHERE status='active' AND updated_at < ? "
-        f"AND project NOT IN ('', '*'){sc} ORDER BY updated_at", (cutoff, *sp)
+        f"AND project NOT IN ('', '*') AND COALESCE(origin,'curated')!='auto'{sc} "
+        f"ORDER BY updated_at", (cutoff, *sp)
     ).fetchall()
     victims = [r["node_id"] for r in rows
                if args.include_successful or _success_weight(conn, r["node_id"]) <= 1.0]
+    # Auto nodes are mechanical audit records — retire them on a shorter TTL.
+    auto_cutoff = (datetime.now(timezone.utc)
+                   - timedelta(days=AUTO_TTL_DAYS)).isoformat(timespec="seconds")
+    auto_rows = conn.execute(
+        f"SELECT node_id FROM nodes WHERE status='active' AND origin='auto' "
+        f"AND updated_at < ?{sc} ORDER BY updated_at", (auto_cutoff, *sp)
+    ).fetchall()
+    victims += [r["node_id"] for r in auto_rows]
     if not victims:
         print(f"Nothing to archive (no active project nodes older than {args.older_than}d"
               f"{'' if args.include_successful else ', excluding measured-successful ones'}).")
@@ -1293,7 +1511,10 @@ def cmd_status(args):
     print(f"  journal       {wal}")
     archived = conn.execute("SELECT COUNT(*) FROM nodes WHERE status='archived'").fetchone()[0]
     merged = conn.execute("SELECT COUNT(*) FROM nodes WHERE status='merged'").fetchone()[0]
-    print(f"  nodes         {active} active / {total} total")
+    auto = conn.execute(
+        "SELECT COUNT(*) FROM nodes WHERE status='active' AND origin='auto'").fetchone()[0]
+    curated = active - auto
+    print(f"  nodes         {active} active ({curated} curated, {auto} auto) / {total} total")
     print(f"  hygiene       {archived} archived, {merged} merged (excluded from recall)")
     print(f"  metrics       {mcount}")
     print(f"  pending       {len(open_pending(conn))} open item(s)")

@@ -153,6 +153,104 @@ class BrainTest(unittest.TestCase):
         brain._ingest_raw(self.conn, raw)
         self.assertIsNotNone(brain.load_node(self.conn, "2026-08-03-tr"))
 
+    # ---- auto-capture (mechanical SessionEnd backstop) ------------------- #
+    def _write_transcript(self, name, lines):
+        tpath = os.path.join(self.tmp, name)
+        with open(tpath, "w") as f:
+            for ln in lines:
+                f.write(json.dumps(ln) + "\n")
+        return tpath
+
+    def _asst(self, *tools):
+        content = [{"type": "tool_use", "name": n, "input": inp} for n, inp in tools]
+        return {"type": "assistant", "message": {"role": "assistant", "content": content}}
+
+    def _ingest_transcript(self, tpath):
+        args = brain.build_parser().parse_args(["ingest", "--from-transcript", tpath])
+        brain.cmd_ingest(args)
+
+    def _auto_id(self):
+        return f"{brain._now()[:10]}-auto-proj-a"
+
+    def test_auto_capture_significant_session(self):
+        tpath = self._write_transcript("sig.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "add MIT license"}},
+            self._asst(("Write", {"file_path": "/x/LICENSE"})),
+            self._asst(("Bash", {"command": "git commit -m x"})),
+        ])
+        self._ingest_transcript(tpath)
+        node = brain.load_node(self.conn, self._auto_id())
+        self.assertIsNotNone(node)
+        self.assertEqual(node["origin"], "auto")
+        self.assertIn("LICENSE", node["tags"])
+        self.assertEqual(node["context"], "add MIT license")
+        self.assertEqual(node["lessons_learned"], "")   # never fabricated
+
+    def test_auto_capture_gate_skips_trivial(self):
+        tpath = self._write_transcript("triv.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "what are embeddings?"}},
+            {"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "vectors."}]}},
+        ])
+        self._ingest_transcript(tpath)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 0)
+
+    def test_auto_capture_never_overrides_a_block(self):
+        # A transcript that DOES carry a block must be captured as curated, not auto.
+        tpath = self._write_transcript("blk.jsonl", [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": '<brain-update>{"node_id":"real-1",'
+                 '"context":"c"}</brain-update>'}]}},
+        ])
+        self._ingest_transcript(tpath)
+        self.assertEqual(brain.load_node(self.conn, "real-1")["origin"], "curated")
+        self.assertIsNone(brain.load_node(self.conn, self._auto_id()))
+
+    def test_auto_excluded_from_recent_but_searchable(self):
+        tpath = self._write_transcript("sig2.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "edit the readme"}},
+            self._asst(("Edit", {"file_path": "/x/README.md"})),
+            self._asst(("Bash", {"command": "git push"})),
+        ])
+        self._ingest_transcript(tpath)
+        recent_ids = {r["node_id"] for r in brain.recent(self.conn, k=10)}
+        self.assertNotIn(self._auto_id(), recent_ids)          # excluded from injection
+        found = {r["node_id"] for r in brain.search(self.conn, "README", k=10)}
+        self.assertIn(self._auto_id(), found)                   # still findable
+
+    def test_auto_capture_never_leaks_command_secrets(self):
+        # A command that carries a secret as a VAR=value prefix must NOT put the
+        # assignment (or the secret) into tags — only the real verb, if clean.
+        tpath = self._write_transcript("leak.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "run the query"}},
+            self._asst(("Write", {"file_path": "/x/q.sql"})),
+            self._asst(("Bash", {"command": 'PGPASSWORD="hunter2secret" psql -c "select 1"'})),
+            self._asst(("Bash", {"command": "WT=/tmp/blob Q=eyJhbGciOi git push"})),
+        ])
+        self._ingest_transcript(tpath)
+        node = brain.load_node(self.conn, self._auto_id())
+        self.assertNotIn("hunter2secret", node["tags"])
+        self.assertNotIn("PGPASSWORD", node["tags"])
+        self.assertNotIn("eyJhbGciOi", node["tags"])
+        self.assertNotIn("=", node["tags"])          # no assignment token survived
+        self.assertIn("psql", node["tags"].split())  # the real verb did
+        self.assertIn("git", node["tags"].split())
+
+    def test_auto_capture_rolls_up_per_day(self):
+        lines = [
+            {"type": "user", "message": {"role": "user", "content": "do work"}},
+            self._asst(("Write", {"file_path": "/x/a.py"})),
+            self._asst(("Bash", {"command": "git commit -m x"})),
+        ]
+        tpath = self._write_transcript("roll.jsonl", lines)
+        self._ingest_transcript(tpath)
+        self._ingest_transcript(tpath)   # a second session the same day
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes WHERE origin='auto'")
+            .fetchone()[0], 1)           # one rolling node, not two
+        m = {x["name"]: x["value"] for x in brain.load_node(self.conn, self._auto_id())["metrics"]}
+        self.assertEqual(m["file_edits"], 2)   # 1 + 1 accumulated across sessions
+
     # ---- collision guard ------------------------------------------------- #
     def test_collision_suffixes_distinct_task(self):
         brain.save_node(self.conn, self.node(node_id="dup", context="task ONE"),
